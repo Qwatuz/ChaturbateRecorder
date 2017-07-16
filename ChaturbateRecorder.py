@@ -1,8 +1,7 @@
-import urllib.request, time, datetime, os, threading, sys, requests, configparser, re, gevent
+import urllib.request, time, datetime, os, threading, sys, multiprocessing, signal, requests, configparser, re
 from bs4 import BeautifulSoup
+from contextlib import contextmanager
 from livestreamer import Livestreamer
-from threading import Thread
-from queue import Queue
 
 Config = configparser.ConfigParser()
 Config.read(sys.path[0] + "/config.conf")
@@ -10,44 +9,45 @@ save_directory = Config.get('paths', 'save_directory')
 wishlist = Config.get('paths', 'wishlist')
 interval = int(Config.get('settings', 'checkInterval'))
 genders = re.sub(' ', '', Config.get('settings', 'genders')).split(",")
-lastPage = {'female': 100, 'couple': 100, 'trans': 100, 'male': 100}
 
-online = []
-q = Queue()
-online = []
+
+class TimeoutException(Exception): pass
+
+@contextmanager
+def time_limit(seconds):
+    def signal_handler(signum, frame):
+        raise TimeoutException("Timed out!")
+
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+
 
 class checkForModels:
-    global q
-    global online
     def getModels(self):
-        workers = []
+        pages = []
         for gender in genders:
             for i in range(1, 50):
-                q.put([i, gender])
-        while not q.empty():
-            for i in range(10):
-                t = Thread(target=getOnlineModels)
-                workers.append(t)
-                t.start()
-            for t in workers:
-                t.join()
-
+                pages.append([i, gender])
+        p = multiprocessing.Pool(3)
+        online = p.map(getOnlineModels, pages)
+        p.terminate()
+        return online
 
 recording = []
-def getOnlineModels():
+def getOnlineModels(args):
     global lastPage
-    global q
-    global online
-    if not q.empty():
-        args = q.get()
-        page = args[0]
-        gender = args[1]
-        if page < lastPage[gender]:
-            attempt = 1
-            while attempt <= 3:
+    MODELS = []
+    page = args[0]
+    gender = args[1]
+    if page < lastPage[gender]:
+        attempt = 1
+        while attempt <= 3:
+            with time_limit(8):
                 try:
-                    timeout = gevent.Timeout(8)
-                    timeout.start()
                     URL = "https://chaturbate.com/{gender}-cams/?page={page}".format(gender=gender.lower(), page=page)
                     result = requests.request('GET', URL)
                     result = result.text
@@ -58,11 +58,11 @@ def getOnlineModels():
                         LIST = soup.findAll('ul', {'class': 'list'})[0]
                         models = LIST.find_all('div', {'class': 'title'})
                         for model in models:
-                            online.append(model.find_all('a', href=True)[0].string.lower()[1:])
+                            MODELS.append(model.find_all('a', href=True)[0].string.lower()[1:])
                     break
-                except gevent.Timeout:
+                except TimeoutException:
                     attempt = attempt + 1
-
+    return MODELS
 
 def startRecording(model):
     try:
@@ -73,6 +73,11 @@ def startRecording(model):
             if "m3u8" in line:
                 stream = line.split("'")[1]
                 break
+        soup = BeautifulSoup(result, 'lxml')
+        soup = soup.findAll('div', id="tabs_content_container")
+        for line in str(soup).split():
+            if 'Sex:' in line:
+                gender = line.split("</dt><dd>")[1][:-5].lower()
         session = Livestreamer()
         session.set_option('http-headers', "referer=https://www.cam4.com/{}".format(model))
         streams = session.streams("hlsvariant://{}"
@@ -80,10 +85,10 @@ def startRecording(model):
         stream = streams["best"]
         fd = stream.open()
         ts = time.time()
-        st = datetime.datetime.fromtimestamp(ts).strftime("%Y.%m.%d_%H.%M.%S")
-        if not os.path.exists("{path}/{model}".format(path=save_directory, model=model)):
-            os.makedirs("{path}/{model}".format(path=save_directory, model=model))
-        with open("{path}/{model}/{st}_{model}.mp4".format(path=save_directory, model=model,
+        st = datetime.datetime.fromtimestamp(ts).strftime("%d.%m.%Y_%H.%M.%S")
+        if not os.path.exists("{path}/{model}_{gender}".format(path=save_directory, model=model, gender=gender)):
+            os.makedirs("{path}/{model}_{gender}".format(path=save_directory, model=model, gender=gender))
+        with open("{path}/{model}_{gender}/{st}_{model}_{gender}.mp4".format(path=save_directory, model=model, gender=gender,
                                                            st=st), 'wb') as f:
             recording.append(model)
             while True:
@@ -119,7 +124,8 @@ if __name__ == '__main__':
         print("the following models are being recorded: {}".format(recording), end="\r")
         lastPage = {'female': 100, 'couple': 100, 'trans': 100, 'male': 100}
         online = []
-        checker.getModels()
+        online = checker.getModels()
+        online = [ent for sublist in online for ent in sublist]
         online = list(set(online))
         with open(wishlist) as f:
             for model in f:
